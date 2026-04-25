@@ -29,10 +29,12 @@ except (ValueError, ImportError):
     except (ValueError, ImportError):
         AppIndicator = None
 
-SOCKET_PATH  = '/run/temp-limiter/daemon.sock'
-DB_PATH      = '/var/lib/temp-limiter/history.db'
-PID_FILE     = '/run/temp-limiter/daemon.pid'
-CONFIG_FILE  = '/etc/temp-limiter.conf'
+SOCKET_PATH   = '/run/temp-limiter/daemon.sock'
+DB_PATH       = '/var/lib/temp-limiter/history.db'
+PID_FILE      = '/run/temp-limiter/daemon.pid'
+CONFIG_FILE   = '/etc/temp-limiter.conf'
+AUTOSTART_DIR = os.path.expanduser('~/.config/autostart')
+AUTOSTART_FILE = os.path.join(AUTOSTART_DIR, 'temp-limiter-ui.desktop')
 
 TIME_WINDOWS = {'2m': 120, '1h': 3600, '6h': 21600, '24h': 86400}
 MAX_POINTS   = 17280   # 24h at 5s intervals
@@ -45,6 +47,17 @@ C_FREQ_LIMIT = (0.431, 0.541, 0.678)
 C_FREQ_CURR  = (0.475, 0.753, 1.0)
 C_GRID       = (1.0,   1.0,   1.0,   0.05)
 C_BG         = (0.11,  0.11,  0.13)
+
+AUTOSTART_DESKTOP = """\
+[Desktop Entry]
+Type=Application
+Name=CPU Temperature Limiter
+Exec=/usr/local/bin/temp-limiter-ui
+Icon=temp-limiter
+Comment=Monitor and limit CPU temperature
+X-GNOME-Autostart-enabled=true
+Hidden={hidden}
+"""
 
 
 # ------------------------------------------------------------------ stat card
@@ -192,12 +205,11 @@ class TempChart(Gtk.DrawingArea):
         cr.rectangle(PL, PT, pw, ph)
         cr.fill()
 
-        # Clip future chart drawing to plot area
         cr.save()
         cr.rectangle(PL, PT, pw, ph)
         cr.clip()
 
-        # Horizontal gridlines (temp)
+        # Horizontal gridlines
         step = 5 if (t_max - t_min) < 25 else 10
         cr.set_source_rgba(*C_GRID)
         cr.set_line_width(1)
@@ -222,9 +234,8 @@ class TempChart(Gtk.DrawingArea):
             cr.set_dash([])
 
         # Event markers
-        ev_cutoff = t_start
         for ev in self.events:
-            if ev['ts'] < ev_cutoff:
+            if ev['ts'] < t_start:
                 continue
             x = tx(ev['ts'])
             if not (PL <= x <= PL + pw):
@@ -244,7 +255,7 @@ class TempChart(Gtk.DrawingArea):
             cr.fill()
 
         if data:
-            # Freq limit — stepped line
+            # Freq limit — stepped
             cr.set_source_rgb(*C_FREQ_LIMIT)
             cr.set_line_width(2)
             prev_y = None
@@ -260,7 +271,7 @@ class TempChart(Gtk.DrawingArea):
                 prev_y = y
             cr.stroke()
 
-            # Freq current — smooth line
+            # Freq current — smooth
             cr.set_source_rgba(*C_FREQ_CURR, 0.8)
             cr.set_line_width(1.5)
             first = True
@@ -278,7 +289,6 @@ class TempChart(Gtk.DrawingArea):
                 for r in data if r.get('temp_package') is not None
             ]
             if temp_pts:
-                # Fill under curve
                 pat = cairo.LinearGradient(0, PT, 0, PT + ph)
                 pat.add_color_stop_rgba(0, *C_TEMP_HOT, 0.25)
                 pat.add_color_stop_rgba(1, *C_TEMP_HOT, 0.0)
@@ -290,20 +300,18 @@ class TempChart(Gtk.DrawingArea):
                 cr.close_path()
                 cr.fill()
 
-                # Colour-coded line segments
                 cr.set_line_width(2.5)
                 i = 0
                 while i < len(temp_pts) - 1:
                     x1, y1, t1 = temp_pts[i]
                     x2, y2, _  = temp_pts[i + 1]
-                    colour = C_TEMP_HOT if t1 > self.threshold else C_TEMP_OK
-                    cr.set_source_rgb(*colour)
+                    cr.set_source_rgb(*(C_TEMP_HOT if t1 > self.threshold else C_TEMP_OK))
                     cr.move_to(x1, y1)
                     cr.line_to(x2, y2)
                     cr.stroke()
                     i += 1
 
-        cr.restore()  # end clip
+        cr.restore()
 
         # Hover crosshair
         if self.hover_x is not None and PL <= self.hover_x <= PL + pw:
@@ -318,8 +326,8 @@ class TempChart(Gtk.DrawingArea):
                 hover_ts = t_start + (hx - PL) / pw * self.window
                 nearest  = min(data, key=lambda r: abs(r['ts'] - hover_ts))
                 if nearest.get('temp_package') is not None:
-                    py = ty_t(nearest['temp_package'])
-                    px = tx(nearest['ts'])
+                    py  = ty_t(nearest['temp_package'])
+                    px  = tx(nearest['ts'])
                     clr = C_TEMP_HOT if nearest['temp_package'] > self.threshold else C_TEMP_OK
                     cr.set_source_rgb(*clr)
                     cr.arc(px, py, 5, 0, 2 * math.pi)
@@ -372,8 +380,8 @@ class TempChart(Gtk.DrawingArea):
         t = int(t_min // step) * step
         while t <= t_max + step:
             if t_min <= t <= t_max:
-                span = max(t_max - t_min, 1)
-                y = PT + ph - (t - t_min) / span * ph
+                span  = max(t_max - t_min, 1)
+                y     = PT + ph - (t - t_min) / span * ph
                 label = f'{t}°'
                 ext   = cr.text_extents(label)
                 cr.move_to(PL - ext.width - 6, y + 4)
@@ -381,7 +389,7 @@ class TempChart(Gtk.DrawingArea):
             t += step
 
         # Right axis — frequency
-        hw_mhz = hw // 1000
+        hw_mhz    = hw // 1000
         freq_step = 500 if hw_mhz > 2000 else 200
         for f_mhz in range(0, hw_mhz + 1, freq_step):
             y = PT + ph - (f_mhz / hw_mhz) * ph if hw_mhz else PT + ph
@@ -430,7 +438,7 @@ class TempChart(Gtk.DrawingArea):
         # Threshold label
         if t_min <= self.threshold <= t_max:
             span = max(t_max - t_min, 1)
-            y = PT + ph - (self.threshold - t_min) / span * ph
+            y    = PT + ph - (self.threshold - t_min) / span * ph
             cr.set_source_rgba(*C_THRESHOLD, 0.7)
             cr.set_font_size(9)
             cr.move_to(PL + 4, y - 4)
@@ -464,12 +472,13 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs)
         self.set_title('CPU Temperature Limiter')
         self.set_default_size(960, 620)
+        self.set_icon_name('temp-limiter')
 
-        self.threshold   = 60.0
-        self.sock        = None
-        self.watch_id    = None
-        self._buf        = b''
-        self.cur_window  = 3600
+        self.threshold  = 60.0
+        self.sock       = None
+        self.watch_id   = None
+        self._buf       = b''
+        self.cur_window = 3600
 
         self._load_threshold()
         self._build_ui()
@@ -477,6 +486,31 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         self._load_history()
         self._connect_socket()
         self._setup_tray()
+
+        # Detect minimise → hide to tray after window is realised
+        self.connect('realize', self._on_realize)
+
+    # ---------------------------------------------------------------- autostart
+
+    def _autostart_enabled(self):
+        """Returns True if autostart is active (no user-level Hidden=true override)."""
+        if not os.path.exists(AUTOSTART_FILE):
+            # No user override → system file in /etc/xdg/autostart/ is active
+            return os.path.exists('/etc/xdg/autostart/temp-limiter-ui.desktop')
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(AUTOSTART_FILE)
+            hidden = cfg.get('Desktop Entry', 'Hidden', fallback='false')
+            return hidden.lower() != 'true'
+        except Exception:
+            return True
+
+    def _set_autostart(self, enabled: bool):
+        os.makedirs(AUTOSTART_DIR, exist_ok=True)
+        with open(AUTOSTART_FILE, 'w') as f:
+            f.write(AUTOSTART_DESKTOP.format(hidden='false' if enabled else 'true'))
+
+    # ---------------------------------------------------------------- cpu info
 
     def _get_cpu_freq_range(self):
         try:
@@ -492,25 +526,74 @@ class TempLimiterWindow(Adw.ApplicationWindow):
             pass
         return None, None
 
+    # ---------------------------------------------------------------- threshold
+
     def _load_threshold(self):
+        # SQLite config table takes precedence (written by UI, persists reboots)
+        try:
+            db  = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True)
+            row = db.execute("SELECT value FROM config WHERE key='threshold'").fetchone()
+            db.close()
+            if row:
+                self.threshold = float(row[0])
+                return
+        except Exception:
+            pass
+        # Fall back to /etc/temp-limiter.conf
         try:
             cfg = configparser.ConfigParser()
             cfg.read(CONFIG_FILE)
             for section in ['default', 'DEFAULT']:
                 if section in cfg and 'threshold' in cfg[section]:
                     self.threshold = cfg[section].getfloat('threshold', 60)
-                    break
+                    return
         except Exception:
             pass
+
+    def _save_threshold(self, value):
+        # Persist in SQLite (daemon reads on SIGHUP; UI reads on next launch)
+        try:
+            db = sqlite3.connect(DB_PATH)
+            db.execute(
+                "INSERT OR REPLACE INTO config (key,value) VALUES ('threshold',?)",
+                (str(value),)
+            )
+            db.commit()
+            db.close()
+        except Exception as e:
+            print(f'DB threshold write: {e}')
+
+        # Also write to /etc/temp-limiter.conf so it survives DB deletion
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(CONFIG_FILE)
+            if 'default' not in cfg:
+                cfg['default'] = {}
+            cfg['default']['threshold'] = str(value)
+            with open(CONFIG_FILE, 'w') as f:
+                cfg.write(f)
+        except Exception:
+            pass  # may lack write permission; SQLite is the primary store
+
+        # Signal daemon to reload
+        try:
+            with open(PID_FILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGHUP)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------- ui
 
     def _build_ui(self):
         toolbar_view = Adw.ToolbarView()
         self.set_content(toolbar_view)
 
-        # Header
+        # Header bar
         header = Adw.HeaderBar()
         header.set_centering_policy(Adw.CenteringPolicy.STRICT)
 
+        # Time window buttons (left)
         time_box = Gtk.Box(spacing=0)
         time_box.add_css_class('linked')
         self._win_btns = {}
@@ -527,6 +610,15 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         first_btn.set_active(True)
         header.pack_start(time_box)
 
+        # Autostart toggle button (right)
+        self._autostart_btn = Gtk.ToggleButton()
+        self._autostart_btn.set_icon_name('system-run-symbolic')
+        self._autostart_btn.set_tooltip_text('Launch on login')
+        self._autostart_btn.set_active(self._autostart_enabled())
+        self._autostart_btn.connect('toggled', self._on_autostart_toggled)
+        header.pack_end(self._autostart_btn)
+
+        # About button (right)
         about_btn = Gtk.Button(icon_name='help-about-symbolic')
         about_btn.set_tooltip_text('About')
         about_btn.connect('clicked', self._show_about)
@@ -572,13 +664,12 @@ class TempLimiterWindow(Adw.ApplicationWindow):
 
         main_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # Threshold control
+        # Controls bar
         ctrl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         ctrl_box.set_margin_top(10)
         ctrl_box.set_margin_bottom(12)
         ctrl_box.set_margin_start(14)
         ctrl_box.set_margin_end(14)
-        ctrl_box.set_halign(Gtk.Align.START)
 
         lbl = Gtk.Label(label='Temperature threshold:')
         lbl.add_css_class('dim-label')
@@ -594,18 +685,16 @@ class TempLimiterWindow(Adw.ApplicationWindow):
 
         ctrl_box.append(Gtk.Label(label='°C'))
 
-        # Spacer then CPU speed range on the right
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         ctrl_box.append(spacer)
 
         min_mhz, max_mhz = self._get_cpu_freq_range()
-        if min_mhz is not None:
-            range_lbl = Gtk.Label(
-                label=f'CPU speed range:  {min_mhz:,} MHz  —  {max_mhz:,} MHz'
-            )
-        else:
-            range_lbl = Gtk.Label(label='CPU speed range: unavailable')
+        range_text = (
+            f'CPU speed range:  {min_mhz:,} MHz  —  {max_mhz:,} MHz'
+            if min_mhz is not None else 'CPU speed range: unavailable'
+        )
+        range_lbl = Gtk.Label(label=range_text)
         range_lbl.add_css_class('dim-label')
         range_lbl.add_css_class('caption')
         ctrl_box.append(range_lbl)
@@ -640,6 +729,31 @@ class TempLimiterWindow(Adw.ApplicationWindow):
     def _load_history(self):
         self.chart.load_history(DB_PATH, max(TIME_WINDOWS.values()))
         self.chart.set_window(self.cur_window)
+
+    # ---------------------------------------------------------------- minimize to tray
+
+    def _on_realize(self, win):
+        surface = self.get_surface()
+        if surface:
+            surface.connect('notify::state', self._on_surface_state)
+
+    def _on_surface_state(self, surface, pspec):
+        try:
+            state = surface.get_state()
+            if state & Gdk.ToplevelState.MINIMIZED and AppIndicator:
+                # Small delay lets the minimize animation finish before hiding
+                GLib.timeout_add(150, self._hide_if_still_minimized)
+        except Exception:
+            pass
+
+    def _hide_if_still_minimized(self):
+        try:
+            surface = self.get_surface()
+            if surface and surface.get_state() & Gdk.ToplevelState.MINIMIZED:
+                self.hide()
+        except Exception:
+            pass
+        return False
 
     # ---------------------------------------------------------------- socket
 
@@ -734,31 +848,13 @@ class TempLimiterWindow(Adw.ApplicationWindow):
 
     def _on_threshold_changed(self, spin):
         val = int(spin.get_value())
-        self.threshold        = val
-        self.chart.threshold  = val
+        self.threshold       = val
+        self.chart.threshold = val
         self.chart.queue_draw()
         self._save_threshold(val)
 
-    def _save_threshold(self, value):
-        # Write to SQLite config (daemon reads on SIGHUP)
-        try:
-            db = sqlite3.connect(DB_PATH)
-            db.execute(
-                "INSERT OR REPLACE INTO config (key,value) VALUES ('threshold',?)",
-                (str(value),)
-            )
-            db.commit()
-            db.close()
-        except Exception as e:
-            print(f'DB threshold write: {e}')
-
-        # Signal daemon to reload
-        try:
-            with open(PID_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGHUP)
-        except Exception:
-            pass
+    def _on_autostart_toggled(self, btn):
+        self._set_autostart(btn.get_active())
 
     def _show_about(self, _btn):
         dlg = Adw.AboutWindow(transient_for=self)
@@ -776,7 +872,7 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         try:
             ind = AppIndicator.Indicator.new(
                 'temp-limiter-ui',
-                'sensors-temperature-symbolic',
+                'temp-limiter',
                 AppIndicator.IndicatorCategory.HARDWARE,
             )
             ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
@@ -815,7 +911,6 @@ class TempLimiterApp(Adw.Application):
         win.present()
 
     def _on_close_request(self, win):
-        # Hide to tray if indicator is available, otherwise quit
         if AppIndicator:
             win.hide()
             return True
