@@ -34,7 +34,7 @@ DB_PATH      = '/var/lib/temp-limiter/history.db'
 PID_FILE     = '/run/temp-limiter/daemon.pid'
 CONFIG_FILE  = '/etc/temp-limiter.conf'
 
-TIME_WINDOWS = {'1h': 3600, '6h': 21600, '24h': 86400}
+TIME_WINDOWS = {'2m': 120, '1h': 3600, '6h': 21600, '24h': 86400}
 MAX_POINTS   = 17280   # 24h at 5s intervals
 
 # Chart colours
@@ -389,7 +389,9 @@ class TempChart(Gtk.DrawingArea):
             cr.show_text(f'{f_mhz}')
 
         # X axis — time labels
-        if self.window <= 3600:
+        if self.window <= 120:
+            tick, fmt = 30,    '%H:%M:%S'
+        elif self.window <= 3600:
             tick, fmt = 300,   '%H:%M'
         elif self.window <= 21600:
             tick, fmt = 1800,  '%H:%M'
@@ -476,6 +478,20 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         self._connect_socket()
         self._setup_tray()
 
+    def _get_cpu_freq_range(self):
+        try:
+            import glob as _glob
+            paths = sorted(_glob.glob('/sys/devices/system/cpu/cpu[0-9]*/cpufreq'))
+            if paths:
+                with open(os.path.join(paths[0], 'cpuinfo_min_freq')) as f:
+                    min_mhz = int(f.read().strip()) // 1000
+                with open(os.path.join(paths[0], 'cpuinfo_max_freq')) as f:
+                    max_mhz = int(f.read().strip()) // 1000
+                return min_mhz, max_mhz
+        except Exception:
+            pass
+        return None, None
+
     def _load_threshold(self):
         try:
             cfg = configparser.ConfigParser()
@@ -499,7 +515,7 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         time_box.add_css_class('linked')
         self._win_btns = {}
         first_btn = None
-        for label in ('1h', '6h', '24h'):
+        for label in ('2m', '1h', '6h', '24h'):
             btn = Gtk.ToggleButton(label=label)
             if first_btn is None:
                 first_btn = btn
@@ -577,6 +593,23 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         ctrl_box.append(self.spin)
 
         ctrl_box.append(Gtk.Label(label='°C'))
+
+        # Spacer then CPU speed range on the right
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        ctrl_box.append(spacer)
+
+        min_mhz, max_mhz = self._get_cpu_freq_range()
+        if min_mhz is not None:
+            range_lbl = Gtk.Label(
+                label=f'CPU speed range:  {min_mhz:,} MHz  —  {max_mhz:,} MHz'
+            )
+        else:
+            range_lbl = Gtk.Label(label='CPU speed range: unavailable')
+        range_lbl.add_css_class('dim-label')
+        range_lbl.add_css_class('caption')
+        ctrl_box.append(range_lbl)
+
         main_box.append(ctrl_box)
 
     def _apply_css(self):
