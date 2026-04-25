@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""CPU Temperature Limiter Daemon v2"""
+
+import os
+import sys
+import time
+import signal
+import logging
+import glob
+import select
+import socket
+import sqlite3
+import json
+import configparser
+import psutil
+
+CONFIG_FILE    = '/etc/temp-limiter.conf'
+LOG_FILE       = '/var/log/temp-limiter.log'
+PID_FILE       = '/run/temp-limiter/daemon.pid'
+SOCKET_PATH    = '/run/temp-limiter/daemon.sock'
+DB_PATH        = '/var/lib/temp-limiter/history.db'
+CPU_PATTERN    = '/sys/devices/system/cpu/cpu[0-9]*/cpufreq'
+CHECK_INTERVAL = 5       # seconds between evaluations
+FREQ_STEP      = 200000  # 200 MHz in kHz
+HYSTERESIS     = 5       # °C below threshold before restoring
+HISTORY_DAYS   = 7
+
+
+class TempLimiterDaemon:
+    def __init__(self):
+        self.threshold   = 60
+        self.running     = True
+        self.cpus        = []
+        self.clients     = []
+        self.server_sock = None
+        self.db          = None
+        self.last_prune  = time.time()
+        self._setup_logging()
+
+    # ------------------------------------------------------------------ logging
+
+    def _setup_logging(self):
+        handlers = [logging.StreamHandler(sys.stdout)]
+        try:
+            handlers.append(logging.FileHandler(LOG_FILE))
+        except Exception:
+            pass
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=handlers,
+            force=True,
+        )
+
+    # ------------------------------------------------------------------ db
+
+    def _open_db(self):
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA synchronous=NORMAL')
+        self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS telemetry (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts            REAL    NOT NULL,
+                temp_package  REAL,
+                temp_core_max REAL,
+                freq_current  INTEGER,
+                freq_limit    INTEGER,
+                freq_hw_max   INTEGER,
+                fan_rpm       INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts           REAL    NOT NULL,
+                event_type   TEXT    NOT NULL,
+                old_freq     INTEGER,
+                new_freq     INTEGER,
+                trigger_temp REAL,
+                detail       TEXT
+            );
+            CREATE TABLE IF NOT EXISTS config (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry(ts);
+            CREATE INDEX IF NOT EXISTS idx_events_ts    ON events(ts);
+        ''')
+        self.db.commit()
+
+    def _log_event(self, event_type, old_freq=None, new_freq=None,
+                   trigger_temp=None, detail=None):
+        try:
+            self.db.execute(
+                'INSERT INTO events (ts,event_type,old_freq,new_freq,trigger_temp,detail) '
+                'VALUES (?,?,?,?,?,?)',
+                (time.time(), event_type, old_freq, new_freq, trigger_temp, detail)
+            )
+            self.db.commit()
+        except Exception as e:
+            logging.error(f'DB event write: {e}')
+
+    def _write_telemetry(self, row):
+        try:
+            self.db.execute(
+                'INSERT INTO telemetry (ts,temp_package,temp_core_max,freq_current,'
+                'freq_limit,freq_hw_max,fan_rpm) VALUES (?,?,?,?,?,?,?)',
+                (row['ts'], row['temp_package'], row['temp_core_max'],
+                 row['freq_current'], row['freq_limit'], row['freq_hw_max'], row['fan_rpm'])
+            )
+            self.db.commit()
+        except Exception as e:
+            logging.error(f'DB telemetry write: {e}')
+
+    def _prune_history(self):
+        cutoff = time.time() - (HISTORY_DAYS * 86400)
+        try:
+            self.db.execute('DELETE FROM telemetry WHERE ts < ?', (cutoff,))
+            self.db.execute('DELETE FROM events    WHERE ts < ?', (cutoff,))
+            self.db.commit()
+        except Exception as e:
+            logging.error(f'DB prune: {e}')
+
+    # ------------------------------------------------------------------ config
+
+    def load_config(self):
+        new_threshold = 60
+        if os.path.exists(CONFIG_FILE):
+            try:
+                cfg = configparser.ConfigParser()
+                cfg.read(CONFIG_FILE)
+                for section in ['default', 'DEFAULT']:
+                    if section in cfg and 'threshold' in cfg[section]:
+                        new_threshold = cfg[section].getint('threshold', 60)
+                        break
+            except Exception as e:
+                logging.error(f'Config read: {e}')
+
+        # SQLite config table takes precedence (written by UI)
+        if self.db:
+            try:
+                row = self.db.execute(
+                    "SELECT value FROM config WHERE key='threshold'"
+                ).fetchone()
+                if row:
+                    new_threshold = int(row[0])
+            except Exception as e:
+                logging.error(f'DB config read: {e}')
+
+        if new_threshold != self.threshold:
+            old = self.threshold
+            self.threshold = new_threshold
+            logging.info(f'Threshold: {old}°C → {new_threshold}°C')
+            if self.db:
+                self._log_event('threshold_change', detail=f'{old}→{new_threshold}°C')
+        else:
+            self.threshold = new_threshold
+
+        logging.info(f'Active threshold: {self.threshold}°C')
+
+    # ------------------------------------------------------------------ cpus
+
+    def find_cpus(self):
+        self.cpus = []
+        for d in sorted(glob.glob(CPU_PATTERN)):
+            try:
+                with open(os.path.join(d, 'cpuinfo_max_freq')) as f:
+                    max_f = int(f.read().strip())
+                with open(os.path.join(d, 'cpuinfo_min_freq')) as f:
+                    min_f = int(f.read().strip())
+                self.cpus.append({
+                    'path':             d,
+                    'max_freq':         max_f,
+                    'min_freq':         min_f,
+                    'scaling_max_path': os.path.join(d, 'scaling_max_freq'),
+                    'scaling_cur_path': os.path.join(d, 'scaling_cur_freq'),
+                })
+            except Exception as e:
+                logging.error(f'CPU discovery {d}: {e}')
+        logging.info(f'Found {len(self.cpus)} CPUs')
+
+    def _read_freq(self, path):
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except Exception:
+            return None
+
+    def _set_freq_limit(self, cpu, new_limit):
+        new_limit = max(cpu['min_freq'], min(cpu['max_freq'], int(new_limit)))
+        try:
+            current = self._read_freq(cpu['scaling_max_path'])
+            if current is not None and current != new_limit:
+                with open(cpu['scaling_max_path'], 'w') as f:
+                    f.write(str(new_limit))
+                return current, new_limit
+        except PermissionError:
+            logging.error(f"Permission denied: {cpu['scaling_max_path']}")
+        except Exception as e:
+            logging.error(f"Freq set error: {e}")
+        return None, None
+
+    def restore_all_cpus(self):
+        logging.info('Restoring all CPUs to hardware max')
+        for cpu in self.cpus:
+            self._set_freq_limit(cpu, cpu['max_freq'])
+
+    # ------------------------------------------------------------------ sensors
+
+    def collect_telemetry(self):
+        ts            = time.time()
+        temp_package  = None
+        temp_core_max = None
+        freq_current  = None
+        freq_limit    = None
+        freq_hw_max   = None
+        fan_rpm       = None
+
+        try:
+            sensors = psutil.sensors_temperatures()
+            if 'coretemp' in sensors:
+                entries  = sensors['coretemp']
+                packages = [c for c in entries if 'Package' in c.label]
+                cores    = [c for c in entries if 'Core'    in c.label]
+                if packages:
+                    temp_package = packages[0].current
+                if cores:
+                    temp_core_max = max(c.current for c in cores)
+                if temp_package is None and cores:
+                    temp_package = temp_core_max
+            elif 'k10temp' in sensors:
+                for c in sensors['k10temp']:
+                    if 'Tctl' in c.label or 'Tdie' in c.label:
+                        temp_package = c.current
+                        break
+        except Exception:
+            pass
+
+        if temp_package is None:
+            for zone in ['/sys/class/thermal/thermal_zone1/temp',
+                         '/sys/class/thermal/thermal_zone0/temp']:
+                try:
+                    with open(zone) as f:
+                        temp_package = int(f.read().strip()) / 1000.0
+                    break
+                except Exception:
+                    pass
+
+        try:
+            fans = psutil.sensors_fans()
+            if fans:
+                all_fans = [f for group in fans.values() for f in group]
+                if all_fans:
+                    fan_rpm = all_fans[0].current
+        except Exception:
+            pass
+
+        if self.cpus:
+            cpu          = self.cpus[0]
+            freq_current = self._read_freq(cpu['scaling_cur_path'])
+            freq_limit   = self._read_freq(cpu['scaling_max_path'])
+            freq_hw_max  = cpu['max_freq']
+
+        return {
+            'ts':            ts,
+            'temp_package':  temp_package,
+            'temp_core_max': temp_core_max,
+            'freq_current':  freq_current,
+            'freq_limit':    freq_limit,
+            'freq_hw_max':   freq_hw_max,
+            'fan_rpm':       fan_rpm,
+        }
+
+    # ------------------------------------------------------------------ throttle
+
+    def evaluate(self, telemetry):
+        temp = telemetry['temp_package']
+        if temp is None:
+            return None
+
+        event = None
+
+        if temp > self.threshold:
+            logging.warning(
+                f'High temp: {temp:.1f}°C > {self.threshold}°C — throttling'
+            )
+            for cpu in self.cpus:
+                curr = self._read_freq(cpu['scaling_max_path'])
+                if curr is None:
+                    continue
+                old, new = self._set_freq_limit(cpu, curr - FREQ_STEP)
+                if old is not None and event is None:
+                    event = {
+                        'type':         'limit_decrease',
+                        'old_freq':     old,
+                        'new_freq':     new,
+                        'trigger_temp': temp,
+                    }
+                    self._log_event('limit_decrease', old, new, temp)
+
+        elif temp < self.threshold - HYSTERESIS:
+            increased = False
+            for cpu in self.cpus:
+                curr = self._read_freq(cpu['scaling_max_path'])
+                if curr is None or curr >= cpu['max_freq']:
+                    continue
+                old, new = self._set_freq_limit(cpu, curr + FREQ_STEP)
+                if old is not None and not increased:
+                    event = {
+                        'type':         'limit_increase',
+                        'old_freq':     old,
+                        'new_freq':     new,
+                        'trigger_temp': temp,
+                    }
+                    self._log_event('limit_increase', old, new, temp)
+                    increased = True
+            if increased:
+                logging.info(f'Safe temp: {temp:.1f}°C — restoring frequencies')
+
+        return event
+
+    # ------------------------------------------------------------------ socket
+
+    def _setup_socket(self):
+        os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
+        if os.path.exists(SOCKET_PATH):
+            os.unlink(SOCKET_PATH)
+        self.server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server_sock.setblocking(False)
+        self.server_sock.bind(SOCKET_PATH)
+        self.server_sock.listen(8)
+        os.chmod(SOCKET_PATH, 0o666)
+        logging.info(f'Socket at {SOCKET_PATH}')
+
+    def _accept_clients(self):
+        try:
+            readable, _, _ = select.select([self.server_sock], [], [], 0)
+            if readable:
+                conn, _ = self.server_sock.accept()
+                conn.setblocking(False)
+                self.clients.append(conn)
+                logging.info(f'Client connected ({len(self.clients)} total)')
+        except Exception:
+            pass
+
+    def _broadcast(self, payload: dict):
+        if not self.clients:
+            return
+        line = (json.dumps(payload) + '\n').encode()
+        dead = []
+        for client in self.clients:
+            try:
+                client.sendall(line)
+            except Exception:
+                dead.append(client)
+        for c in dead:
+            self.clients.remove(c)
+            try:
+                c.close()
+            except Exception:
+                pass
+        if dead:
+            logging.info(
+                f'Removed {len(dead)} dead clients ({len(self.clients)} remaining)'
+            )
+
+    # ------------------------------------------------------------------ signals
+
+    def _handle_signal(self, signum, frame):
+        if signum == signal.SIGHUP:
+            logging.info('SIGHUP — reloading config')
+            self.load_config()
+        else:
+            logging.info(f'Signal {signum} — shutting down')
+            self.running = False
+
+    # ------------------------------------------------------------------ run
+
+    def _write_pid(self):
+        try:
+            os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+            with open(PID_FILE, 'w') as f:
+                f.write(str(os.getpid()) + '\n')
+        except Exception as e:
+            logging.warning(f'Could not write PID file: {e}')
+
+    def run(self):
+        if os.getuid() != 0:
+            logging.warning('Not running as root — frequency adjustments will fail')
+
+        logging.info('Daemon v2 starting')
+        self._write_pid()
+        self._open_db()
+        self.load_config()
+        self.find_cpus()
+        self._setup_socket()
+        self._log_event('daemon_start', detail=f'threshold={self.threshold}°C')
+
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT,  self._handle_signal)
+        signal.signal(signal.SIGHUP,  self._handle_signal)
+
+        while self.running:
+            self._accept_clients()
+            telemetry = self.collect_telemetry()
+            event     = self.evaluate(telemetry)
+            self._write_telemetry(telemetry)
+
+            payload          = dict(telemetry)
+            payload['event'] = event
+            self._broadcast(payload)
+
+            if time.time() - self.last_prune > 3600:
+                self._prune_history()
+                self.last_prune = time.time()
+
+            time.sleep(CHECK_INTERVAL)
+
+        self._log_event('daemon_stop')
+        self.restore_all_cpus()
+        if self.db:
+            self.db.close()
+        if os.path.exists(SOCKET_PATH):
+            os.unlink(SOCKET_PATH)
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+        logging.info('Daemon stopped')
+
+
+if __name__ == '__main__':
+    daemon = TempLimiterDaemon()
+    try:
+        daemon.run()
+    except Exception as e:
+        logging.critical(f'Fatal: {e}', exc_info=True)
+        sys.exit(1)

@@ -1,0 +1,18 @@
+[Unit]
+Description=CPU Temperature Limiter Daemon v2
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/temp-limiter-daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+RuntimeDirectory=temp-limiter
+RuntimeDirectoryMode=0755
+StateDirectory=temp-limiter
+StateDirectoryMode=0777
+
+[Install]
+WantedBy=multi-user.target

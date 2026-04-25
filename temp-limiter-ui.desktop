@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Temperature Limiter
+Comment=Monitor and limit CPU temperature
+Exec=/usr/local/bin/temp-limiter-ui
+Icon=temp-limiter
+Terminal=false
+Categories=System;Monitor;
+X-GNOME-Autostart-enabled=true

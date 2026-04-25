@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""CPU Temperature Limiter UI v2 — GTK4 + libadwaita"""
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, GLib, Gdk
+
+import cairo
+import math
+import os
+import sys
+import json
+import socket
+import sqlite3
+import time
+import signal
+import configparser
+from collections import deque
+from datetime import datetime
+
+try:
+    gi.require_version('AyatanaAppIndicator3', '0.1')
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ValueError, ImportError):
+    try:
+        gi.require_version('AppIndicator3', '0.1')
+        from gi.repository import AppIndicator3 as AppIndicator
+    except (ValueError, ImportError):
+        AppIndicator = None
+
+SOCKET_PATH  = '/run/temp-limiter/daemon.sock'
+DB_PATH      = '/var/lib/temp-limiter/history.db'
+PID_FILE     = '/run/temp-limiter/daemon.pid'
+CONFIG_FILE  = '/etc/temp-limiter.conf'
+
+TIME_WINDOWS = {'1h': 3600, '6h': 21600, '24h': 86400}
+MAX_POINTS   = 17280   # 24h at 5s intervals
+
+# Chart colours
+C_TEMP_OK    = (0.341, 0.671, 0.353)
+C_TEMP_HOT   = (0.898, 0.325, 0.294)
+C_THRESHOLD  = (0.941, 0.533, 0.243)
+C_FREQ_LIMIT = (0.431, 0.541, 0.678)
+C_FREQ_CURR  = (0.475, 0.753, 1.0)
+C_GRID       = (1.0,   1.0,   1.0,   0.05)
+C_BG         = (0.11,  0.11,  0.13)
+
+
+# ------------------------------------------------------------------ stat card
+
+class StatCard(Gtk.Box):
+    def __init__(self, label, unit=''):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.set_hexpand(True)
+        self.add_css_class('stat-card')
+        self._unit = unit
+
+        lbl = Gtk.Label(label=label)
+        lbl.add_css_class('caption')
+        lbl.add_css_class('dim-label')
+        lbl.set_halign(Gtk.Align.CENTER)
+        self.append(lbl)
+
+        self._val = Gtk.Label(label='--')
+        self._val.add_css_class('stat-value')
+        self._val.set_halign(Gtk.Align.CENTER)
+        self.append(self._val)
+
+    def update(self, value, colour_class=None):
+        self._val.set_text(str(value) + self._unit)
+        for cls in ('stat-ok', 'stat-warn', 'stat-hot', 'stat-dim'):
+            self._val.remove_css_class(cls)
+        if colour_class:
+            self._val.add_css_class(colour_class)
+
+
+# ------------------------------------------------------------------ chart
+
+class TempChart(Gtk.DrawingArea):
+    PAD_L = 52
+    PAD_R = 68
+    PAD_T = 22
+    PAD_B = 38
+
+    def __init__(self):
+        super().__init__()
+        self.set_vexpand(True)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+        self.points    = deque(maxlen=MAX_POINTS)
+        self.events    = deque(maxlen=1000)
+        self.window    = 3600
+        self.threshold = 60.0
+        self.hw_max    = None
+        self.hover_x   = None
+
+        motion = Gtk.EventControllerMotion.new()
+        motion.connect('motion', self._on_motion)
+        motion.connect('leave',  self._on_leave)
+        self.add_controller(motion)
+
+    def set_window(self, seconds):
+        self.window = seconds
+        self.queue_draw()
+
+    def add_point(self, row):
+        self.points.append(row)
+        if row.get('freq_hw_max'):
+            self.hw_max = row['freq_hw_max']
+        self.queue_draw()
+
+    def add_event(self, ev, ts):
+        self.events.append({'ts': ts, **ev})
+
+    def load_history(self, db_path, window_secs):
+        try:
+            db     = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+            cutoff = time.time() - window_secs
+            rows   = db.execute(
+                'SELECT ts,temp_package,temp_core_max,freq_current,freq_limit,freq_hw_max,fan_rpm '
+                'FROM telemetry WHERE ts>=? ORDER BY ts',
+                (cutoff,)
+            ).fetchall()
+            for r in rows:
+                self.points.append({
+                    'ts': r[0], 'temp_package': r[1], 'temp_core_max': r[2],
+                    'freq_current': r[3], 'freq_limit': r[4],
+                    'freq_hw_max': r[5], 'fan_rpm': r[6],
+                })
+            evts = db.execute(
+                'SELECT ts,event_type,old_freq,new_freq,trigger_temp,detail '
+                'FROM events WHERE ts>=?',
+                (cutoff,)
+            ).fetchall()
+            for e in evts:
+                self.events.append({
+                    'ts': e[0], 'type': e[1], 'old_freq': e[2],
+                    'new_freq': e[3], 'trigger_temp': e[4], 'detail': e[5],
+                })
+            if self.points:
+                self.hw_max = self.points[-1].get('freq_hw_max')
+            db.close()
+        except Exception as e:
+            print(f'History load: {e}')
+        self.queue_draw()
+
+    def _on_motion(self, ctrl, x, y):
+        self.hover_x = x
+        self.queue_draw()
+
+    def _on_leave(self, ctrl):
+        self.hover_x = None
+        self.queue_draw()
+
+    def _visible(self):
+        cutoff = time.time() - self.window
+        return [r for r in self.points if r['ts'] >= cutoff]
+
+    def _temp_range(self, data):
+        temps = [r['temp_package'] for r in data if r.get('temp_package') is not None]
+        if not temps:
+            return (35.0, 85.0)
+        return (max(0.0, min(temps) - 5), max(self.threshold + 10, max(temps) + 5))
+
+    def _draw(self, area, cr, width, height):
+        PL, PR, PT, PB = self.PAD_L, self.PAD_R, self.PAD_T, self.PAD_B
+        pw = width  - PL - PR
+        ph = height - PT - PB
+        if pw < 10 or ph < 10:
+            return
+
+        data    = self._visible()
+        now     = time.time()
+        t_start = now - self.window
+        t_min, t_max = self._temp_range(data)
+        hw      = self.hw_max or 4200000
+
+        def tx(ts):
+            return PL + (ts - t_start) / self.window * pw
+
+        def ty_t(t):
+            span = max(t_max - t_min, 1)
+            return PT + ph - (t - t_min) / span * ph
+
+        def ty_f(khz):
+            return PT + ph - (khz / hw) * ph
+
+        # Plot background
+        cr.set_source_rgb(*C_BG)
+        cr.rectangle(PL, PT, pw, ph)
+        cr.fill()
+
+        # Clip future chart drawing to plot area
+        cr.save()
+        cr.rectangle(PL, PT, pw, ph)
+        cr.clip()
+
+        # Horizontal gridlines (temp)
+        step = 5 if (t_max - t_min) < 25 else 10
+        cr.set_source_rgba(*C_GRID)
+        cr.set_line_width(1)
+        t = int(t_min // step) * step
+        while t <= t_max + step:
+            if t_min <= t <= t_max:
+                y = ty_t(t)
+                cr.move_to(PL, y)
+                cr.line_to(PL + pw, y)
+                cr.stroke()
+            t += step
+
+        # Threshold line
+        if t_min <= self.threshold <= t_max:
+            y = ty_t(self.threshold)
+            cr.set_source_rgba(*C_THRESHOLD, 0.9)
+            cr.set_line_width(1.5)
+            cr.set_dash([7, 4])
+            cr.move_to(PL, y)
+            cr.line_to(PL + pw, y)
+            cr.stroke()
+            cr.set_dash([])
+
+        # Event markers
+        ev_cutoff = t_start
+        for ev in self.events:
+            if ev['ts'] < ev_cutoff:
+                continue
+            x = tx(ev['ts'])
+            if not (PL <= x <= PL + pw):
+                continue
+            cr.set_source_rgba(*C_THRESHOLD, 0.45)
+            cr.set_line_width(1)
+            cr.set_dash([3, 3])
+            cr.move_to(x, PT)
+            cr.line_to(x, PT + ph)
+            cr.stroke()
+            cr.set_dash([])
+            cr.set_source_rgba(*C_THRESHOLD, 0.8)
+            cr.move_to(x,     PT + 9)
+            cr.line_to(x - 5, PT)
+            cr.line_to(x + 5, PT)
+            cr.close_path()
+            cr.fill()
+
+        if data:
+            # Freq limit — stepped line
+            cr.set_source_rgb(*C_FREQ_LIMIT)
+            cr.set_line_width(2)
+            prev_y = None
+            for row in data:
+                if row.get('freq_limit') is None:
+                    continue
+                x, y = tx(row['ts']), ty_f(row['freq_limit'])
+                if prev_y is None:
+                    cr.move_to(x, y)
+                else:
+                    cr.line_to(x, prev_y)
+                    cr.line_to(x, y)
+                prev_y = y
+            cr.stroke()
+
+            # Freq current — smooth line
+            cr.set_source_rgba(*C_FREQ_CURR, 0.8)
+            cr.set_line_width(1.5)
+            first = True
+            for row in data:
+                if row.get('freq_current') is None:
+                    continue
+                x, y = tx(row['ts']), ty_f(row['freq_current'])
+                cr.move_to(x, y) if first else cr.line_to(x, y)
+                first = False
+            cr.stroke()
+
+            # Temperature — gradient fill + colour-coded line
+            temp_pts = [
+                (tx(r['ts']), ty_t(r['temp_package']), r['temp_package'])
+                for r in data if r.get('temp_package') is not None
+            ]
+            if temp_pts:
+                # Fill under curve
+                pat = cairo.LinearGradient(0, PT, 0, PT + ph)
+                pat.add_color_stop_rgba(0, *C_TEMP_HOT, 0.25)
+                pat.add_color_stop_rgba(1, *C_TEMP_HOT, 0.0)
+                cr.set_source(pat)
+                cr.move_to(temp_pts[0][0], PT + ph)
+                for px, py, _ in temp_pts:
+                    cr.line_to(px, py)
+                cr.line_to(temp_pts[-1][0], PT + ph)
+                cr.close_path()
+                cr.fill()
+
+                # Colour-coded line segments
+                cr.set_line_width(2.5)
+                i = 0
+                while i < len(temp_pts) - 1:
+                    x1, y1, t1 = temp_pts[i]
+                    x2, y2, _  = temp_pts[i + 1]
+                    colour = C_TEMP_HOT if t1 > self.threshold else C_TEMP_OK
+                    cr.set_source_rgb(*colour)
+                    cr.move_to(x1, y1)
+                    cr.line_to(x2, y2)
+                    cr.stroke()
+                    i += 1
+
+        cr.restore()  # end clip
+
+        # Hover crosshair
+        if self.hover_x is not None and PL <= self.hover_x <= PL + pw:
+            hx = self.hover_x
+            cr.set_source_rgba(1, 1, 1, 0.25)
+            cr.set_line_width(1)
+            cr.move_to(hx, PT)
+            cr.line_to(hx, PT + ph)
+            cr.stroke()
+
+            if data:
+                hover_ts = t_start + (hx - PL) / pw * self.window
+                nearest  = min(data, key=lambda r: abs(r['ts'] - hover_ts))
+                if nearest.get('temp_package') is not None:
+                    py = ty_t(nearest['temp_package'])
+                    px = tx(nearest['ts'])
+                    clr = C_TEMP_HOT if nearest['temp_package'] > self.threshold else C_TEMP_OK
+                    cr.set_source_rgb(*clr)
+                    cr.arc(px, py, 5, 0, 2 * math.pi)
+                    cr.fill()
+                    self._draw_tooltip(cr, hx + 12, PT + 10, nearest, width)
+
+        self._draw_axes(cr, PL, PR, PT, PB, pw, ph, t_min, t_max, hw, now, t_start)
+        self._draw_legend(cr, PL, PT)
+
+    def _draw_tooltip(self, cr, x, y, row, chart_width):
+        cr.select_font_face('Monospace', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(11)
+
+        lines = [datetime.fromtimestamp(row['ts']).strftime('%H:%M:%S')]
+        if row.get('temp_package') is not None:
+            lines.append(f"Temp:  {row['temp_package']:.1f}°C")
+        if row.get('freq_current') is not None:
+            lines.append(f"Freq:  {row['freq_current'] // 1000} MHz")
+        if row.get('freq_limit') is not None:
+            lines.append(f"Limit: {row['freq_limit'] // 1000} MHz")
+
+        pad    = 8
+        line_h = 16
+        max_w  = max(cr.text_extents(l).width for l in lines)
+        bw     = max_w + pad * 2
+        bh     = len(lines) * line_h + pad * 2
+
+        if x + bw + 10 > chart_width:
+            x = x - bw - 24
+
+        cr.set_source_rgba(0.08, 0.08, 0.10, 0.92)
+        cr.rectangle(x, y, bw, bh)
+        cr.fill()
+        cr.set_source_rgba(1, 1, 1, 0.15)
+        cr.set_line_width(1)
+        cr.rectangle(x, y, bw, bh)
+        cr.stroke()
+        cr.set_source_rgb(0.88, 0.88, 0.88)
+        for i, line in enumerate(lines):
+            cr.move_to(x + pad, y + pad + (i + 1) * line_h - 4)
+            cr.show_text(line)
+
+    def _draw_axes(self, cr, PL, PR, PT, PB, pw, ph, t_min, t_max, hw, now, t_start):
+        cr.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(10)
+        cr.set_source_rgba(1, 1, 1, 0.55)
+
+        # Left axis — temperature
+        step = 5 if (t_max - t_min) < 25 else 10
+        t = int(t_min // step) * step
+        while t <= t_max + step:
+            if t_min <= t <= t_max:
+                span = max(t_max - t_min, 1)
+                y = PT + ph - (t - t_min) / span * ph
+                label = f'{t}°'
+                ext   = cr.text_extents(label)
+                cr.move_to(PL - ext.width - 6, y + 4)
+                cr.show_text(label)
+            t += step
+
+        # Right axis — frequency
+        hw_mhz = hw // 1000
+        freq_step = 500 if hw_mhz > 2000 else 200
+        for f_mhz in range(0, hw_mhz + 1, freq_step):
+            y = PT + ph - (f_mhz / hw_mhz) * ph if hw_mhz else PT + ph
+            cr.move_to(PL + pw + 6, y + 4)
+            cr.show_text(f'{f_mhz}')
+
+        # X axis — time labels
+        if self.window <= 3600:
+            tick, fmt = 300,   '%H:%M'
+        elif self.window <= 21600:
+            tick, fmt = 1800,  '%H:%M'
+        else:
+            tick, fmt = 14400, '%H:%M'
+
+        t = (int(t_start / tick) + 1) * tick
+        while t <= now:
+            x = PL + (t - t_start) / self.window * pw
+            if PL <= x <= PL + pw:
+                label = datetime.fromtimestamp(t).strftime(fmt)
+                ext   = cr.text_extents(label)
+                cr.move_to(x - ext.width / 2, PT + ph + 16)
+                cr.show_text(label)
+            t += tick
+
+        # Axis labels
+        cr.set_source_rgba(1, 1, 1, 0.3)
+        cr.set_font_size(9)
+        cr.save()
+        cr.translate(11, PT + ph / 2)
+        cr.rotate(-math.pi / 2)
+        ext = cr.text_extents('Temperature (°C)')
+        cr.move_to(-ext.width / 2, 0)
+        cr.show_text('Temperature (°C)')
+        cr.restore()
+
+        cr.save()
+        cr.translate(PL + pw + PR - 10, PT + ph / 2)
+        cr.rotate(math.pi / 2)
+        ext = cr.text_extents('Frequency (MHz)')
+        cr.move_to(-ext.width / 2, 0)
+        cr.show_text('Frequency (MHz)')
+        cr.restore()
+
+        # Threshold label
+        if t_min <= self.threshold <= t_max:
+            span = max(t_max - t_min, 1)
+            y = PT + ph - (self.threshold - t_min) / span * ph
+            cr.set_source_rgba(*C_THRESHOLD, 0.7)
+            cr.set_font_size(9)
+            cr.move_to(PL + 4, y - 4)
+            cr.show_text(f'{self.threshold:.0f}°C limit')
+
+    def _draw_legend(self, cr, PL, PT):
+        items = [
+            (C_TEMP_OK,    'Temperature'),
+            (C_THRESHOLD,  'Threshold'),
+            (C_FREQ_LIMIT, 'Freq Limit'),
+            (C_FREQ_CURR,  'Freq Current'),
+        ]
+        cr.select_font_face('Sans', cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(10)
+        x = PL + 8
+        y = PT + 16
+        for colour, label in items:
+            cr.set_source_rgb(*colour)
+            cr.rectangle(x, y - 7, 16, 3)
+            cr.fill()
+            cr.set_source_rgba(1, 1, 1, 0.6)
+            cr.move_to(x + 20, y)
+            cr.show_text(label)
+            x += 110
+
+
+# ------------------------------------------------------------------ window
+
+class TempLimiterWindow(Adw.ApplicationWindow):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_title('CPU Temperature Limiter')
+        self.set_default_size(960, 620)
+
+        self.threshold   = 60.0
+        self.sock        = None
+        self.watch_id    = None
+        self._buf        = b''
+        self.cur_window  = 3600
+
+        self._load_threshold()
+        self._build_ui()
+        self._apply_css()
+        self._load_history()
+        self._connect_socket()
+        self._setup_tray()
+
+    def _load_threshold(self):
+        try:
+            cfg = configparser.ConfigParser()
+            cfg.read(CONFIG_FILE)
+            for section in ['default', 'DEFAULT']:
+                if section in cfg and 'threshold' in cfg[section]:
+                    self.threshold = cfg[section].getfloat('threshold', 60)
+                    break
+        except Exception:
+            pass
+
+    def _build_ui(self):
+        toolbar_view = Adw.ToolbarView()
+        self.set_content(toolbar_view)
+
+        # Header
+        header = Adw.HeaderBar()
+        header.set_centering_policy(Adw.CenteringPolicy.STRICT)
+
+        time_box = Gtk.Box(spacing=0)
+        time_box.add_css_class('linked')
+        self._win_btns = {}
+        first_btn = None
+        for label in ('1h', '6h', '24h'):
+            btn = Gtk.ToggleButton(label=label)
+            if first_btn is None:
+                first_btn = btn
+            else:
+                btn.set_group(first_btn)
+            btn.connect('toggled', self._on_window_toggled, label)
+            time_box.append(btn)
+            self._win_btns[label] = btn
+        first_btn.set_active(True)
+        header.pack_start(time_box)
+
+        about_btn = Gtk.Button(icon_name='help-about-symbolic')
+        about_btn.set_tooltip_text('About')
+        about_btn.connect('clicked', self._show_about)
+        header.pack_end(about_btn)
+
+        toolbar_view.add_top_bar(header)
+
+        # Content
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        toolbar_view.set_content(main_box)
+
+        # Disconnected banner
+        self.banner = Adw.Banner()
+        self.banner.set_title('Daemon not running — connect it to see live data')
+        self.banner.set_revealed(False)
+        main_box.append(self.banner)
+
+        # Stat cards
+        cards_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        cards_box.set_margin_top(14)
+        cards_box.set_margin_bottom(10)
+        cards_box.set_margin_start(14)
+        cards_box.set_margin_end(14)
+
+        self.card_temp  = StatCard('CPU TEMP',    '°C')
+        self.card_limit = StatCard('FREQ LIMIT', ' MHz')
+        self.card_freq  = StatCard('CURR FREQ',  ' MHz')
+        self.card_fan   = StatCard('FAN',         '')
+
+        for card in (self.card_temp, self.card_limit, self.card_freq, self.card_fan):
+            cards_box.append(card)
+        main_box.append(cards_box)
+
+        main_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # Chart
+        self.chart = TempChart()
+        self.chart.threshold = self.threshold
+        self.chart.set_margin_top(6)
+        self.chart.set_margin_start(4)
+        self.chart.set_margin_end(4)
+        main_box.append(self.chart)
+
+        main_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # Threshold control
+        ctrl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        ctrl_box.set_margin_top(10)
+        ctrl_box.set_margin_bottom(12)
+        ctrl_box.set_margin_start(14)
+        ctrl_box.set_margin_end(14)
+        ctrl_box.set_halign(Gtk.Align.START)
+
+        lbl = Gtk.Label(label='Temperature threshold:')
+        lbl.add_css_class('dim-label')
+        ctrl_box.append(lbl)
+
+        adj = Gtk.Adjustment(
+            value=self.threshold, lower=20, upper=100,
+            step_increment=1, page_increment=5,
+        )
+        self.spin = Gtk.SpinButton(adjustment=adj, digits=0)
+        self.spin.connect('value-changed', self._on_threshold_changed)
+        ctrl_box.append(self.spin)
+
+        ctrl_box.append(Gtk.Label(label='°C'))
+        main_box.append(ctrl_box)
+
+    def _apply_css(self):
+        css = b"""
+        .stat-card {
+            border-radius: 14px;
+            padding: 12px 16px;
+            background-color: alpha(white, 0.05);
+            border: 1px solid alpha(white, 0.08);
+        }
+        .stat-value {
+            font-size: 26px;
+            font-weight: bold;
+        }
+        .stat-ok   { color: #57ab5a; }
+        .stat-warn { color: #f5c211; }
+        .stat-hot  { color: #e5534b; }
+        .stat-dim  { color: alpha(currentColor, 0.4); }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+    def _load_history(self):
+        self.chart.load_history(DB_PATH, max(TIME_WINDOWS.values()))
+        self.chart.set_window(self.cur_window)
+
+    # ---------------------------------------------------------------- socket
+
+    def _connect_socket(self):
+        if not os.path.exists(SOCKET_PATH):
+            self.banner.set_revealed(True)
+            GLib.timeout_add_seconds(5, self._retry_socket)
+            return
+        try:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(SOCKET_PATH)
+            self.sock.setblocking(False)
+            self.watch_id = GLib.io_add_watch(
+                self.sock.fileno(),
+                GLib.IO_IN | GLib.IO_HUP,
+                self._on_socket_data,
+            )
+            self.banner.set_revealed(False)
+        except Exception as e:
+            print(f'Socket connect: {e}')
+            self.banner.set_revealed(True)
+            GLib.timeout_add_seconds(5, self._retry_socket)
+
+    def _retry_socket(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        self._connect_socket()
+        return False
+
+    def _on_socket_data(self, fd, condition):
+        if condition & GLib.IO_HUP:
+            self.banner.set_revealed(True)
+            self.sock = None
+            GLib.timeout_add_seconds(5, self._retry_socket)
+            return False
+        try:
+            chunk = self.sock.recv(8192)
+            if not chunk:
+                self.banner.set_revealed(True)
+                self.sock = None
+                GLib.timeout_add_seconds(5, self._retry_socket)
+                return False
+            self._buf += chunk
+            while b'\n' in self._buf:
+                line, self._buf = self._buf.split(b'\n', 1)
+                try:
+                    self._on_telemetry(json.loads(line))
+                except Exception:
+                    pass
+        except BlockingIOError:
+            pass
+        except Exception as e:
+            print(f'Socket read: {e}')
+            self.banner.set_revealed(True)
+            return False
+        return True
+
+    def _on_telemetry(self, row):
+        self.chart.add_point(row)
+
+        if row.get('event'):
+            self.chart.add_event(row['event'], row['ts'])
+
+        temp = row.get('temp_package')
+        if temp is not None:
+            self.card_temp.update(
+                f'{temp:.1f}',
+                'stat-hot'  if temp > self.threshold
+                else 'stat-warn' if temp > self.threshold - 10
+                else 'stat-ok',
+            )
+
+        if row.get('freq_limit') is not None:
+            self.card_limit.update(f"{row['freq_limit'] // 1000}")
+
+        if row.get('freq_current') is not None:
+            self.card_freq.update(f"{row['freq_current'] // 1000}")
+
+        fan = row.get('fan_rpm')
+        self.card_fan.update(f'{fan} RPM' if fan else 'N/A', 'stat-dim' if not fan else None)
+
+    # ---------------------------------------------------------------- controls
+
+    def _on_window_toggled(self, btn, label):
+        if btn.get_active() and hasattr(self, 'chart'):
+            self.cur_window = TIME_WINDOWS[label]
+            self.chart.set_window(self.cur_window)
+
+    def _on_threshold_changed(self, spin):
+        val = int(spin.get_value())
+        self.threshold        = val
+        self.chart.threshold  = val
+        self.chart.queue_draw()
+        self._save_threshold(val)
+
+    def _save_threshold(self, value):
+        # Write to SQLite config (daemon reads on SIGHUP)
+        try:
+            db = sqlite3.connect(DB_PATH)
+            db.execute(
+                "INSERT OR REPLACE INTO config (key,value) VALUES ('threshold',?)",
+                (str(value),)
+            )
+            db.commit()
+            db.close()
+        except Exception as e:
+            print(f'DB threshold write: {e}')
+
+        # Signal daemon to reload
+        try:
+            with open(PID_FILE) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGHUP)
+        except Exception:
+            pass
+
+    def _show_about(self, _btn):
+        dlg = Adw.AboutWindow(transient_for=self)
+        dlg.set_application_name('CPU Temperature Limiter')
+        dlg.set_version('2.0')
+        dlg.set_comments('Monitors and throttles CPU temperature in real time.')
+        dlg.set_license_type(Gtk.License.MIT_X11)
+        dlg.present()
+
+    # ---------------------------------------------------------------- tray
+
+    def _setup_tray(self):
+        if not AppIndicator:
+            return
+        try:
+            ind = AppIndicator.Indicator.new(
+                'temp-limiter-ui',
+                'sensors-temperature-symbolic',
+                AppIndicator.IndicatorCategory.HARDWARE,
+            )
+            ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            ind.set_menu(self._build_tray_menu())
+            self._indicator = ind
+        except Exception as e:
+            print(f'Tray setup: {e}')
+
+    def _build_tray_menu(self):
+        menu = Gtk.Menu()
+
+        show = Gtk.MenuItem(label='Open Temperature Limiter')
+        show.connect('activate', lambda _: self.present())
+        menu.append(show)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label='Quit')
+        quit_item.connect('activate', lambda _: self.get_application().quit())
+        menu.append(quit_item)
+
+        menu.show_all()
+        return menu
+
+
+# ------------------------------------------------------------------ application
+
+class TempLimiterApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='io.local.TempLimiter')
+        self.connect('activate', self._on_activate)
+
+    def _on_activate(self, _app):
+        win = TempLimiterWindow(application=self)
+        win.connect('close-request', self._on_close_request)
+        win.present()
+
+    def _on_close_request(self, win):
+        # Hide to tray if indicator is available, otherwise quit
+        if AppIndicator:
+            win.hide()
+            return True
+        return False
+
+
+if __name__ == '__main__':
+    app = TempLimiterApp()
+    sys.exit(app.run(sys.argv))
