@@ -733,6 +733,8 @@ class TempLimiterWindow(Adw.ApplicationWindow):
     # ---------------------------------------------------------------- minimize to tray
 
     def _on_realize(self, win):
+        if not AppIndicator:
+            return
         surface = self.get_surface()
         if surface:
             surface.connect('notify::state', self._on_surface_state)
@@ -740,20 +742,24 @@ class TempLimiterWindow(Adw.ApplicationWindow):
     def _on_surface_state(self, surface, pspec):
         try:
             state = surface.get_state()
-            if state & Gdk.ToplevelState.MINIMIZED and AppIndicator:
-                # Small delay lets the minimize animation finish before hiding
-                GLib.timeout_add(150, self._hide_if_still_minimized)
+            if state & Gdk.ToplevelState.MINIMIZED:
+                # idle_add with low priority runs after the WM has fully
+                # processed the minimize, making the state check reliable
+                GLib.idle_add(
+                    self._hide_if_still_minimized,
+                    priority=GLib.PRIORITY_DEFAULT_IDLE,
+                )
         except Exception:
             pass
 
     def _hide_if_still_minimized(self):
         try:
             surface = self.get_surface()
-            if surface and surface.get_state() & Gdk.ToplevelState.MINIMIZED:
+            if surface and (surface.get_state() & Gdk.ToplevelState.MINIMIZED):
                 self.hide()
         except Exception:
             pass
-        return False
+        return False  # don't repeat
 
     # ---------------------------------------------------------------- socket
 
@@ -857,12 +863,12 @@ class TempLimiterWindow(Adw.ApplicationWindow):
         self._set_autostart(btn.get_active())
 
     def _show_about(self, _btn):
-        dlg = Adw.AboutWindow(transient_for=self)
+        dlg = Adw.AboutDialog()
         dlg.set_application_name('CPU Temperature Limiter')
         dlg.set_version('2.0')
         dlg.set_comments('Monitors and throttles CPU temperature in real time.')
         dlg.set_license_type(Gtk.License.MIT_X11)
-        dlg.present()
+        dlg.present(self)  # present(parent) brings dialog to foreground
 
     # ---------------------------------------------------------------- tray
 
